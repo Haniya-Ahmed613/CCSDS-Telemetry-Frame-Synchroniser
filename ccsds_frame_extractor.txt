@@ -1,0 +1,124 @@
+`timescale 1ns/1ps
+
+module ccsds_sync_top #(
+    parameter [31:0]  SYNC_WORD             = 32'h1ACFFC1D,
+    parameter integer CORRELATION_THRESHOLD = 0,
+    parameter integer HEADER_BITS           = 16,
+    parameter integer PAYLOAD_BITS          = 64,
+    parameter integer VCID_WIDTH            = 3,
+    parameter integer VCID_LSB              = 11
+)(
+    input  wire clk,
+    input  wire rst,
+    input  wire rx_bit,
+
+    // Status / Telemetry Monitoring
+    output wire sync_candidate,
+    output wire window_valid,
+    output wire locked,
+    output wire [1:0] state_debug,
+    output wire marker_check_due,
+    output wire marker_match,
+
+    // Frame Extractor Outputs
+    output wire [HEADER_BITS-1:0]  header_out,
+    output wire [PAYLOAD_BITS-1:0] payload_out,
+    output wire [VCID_WIDTH-1:0]   vcid_out,
+    output wire                    frame_valid
+);
+
+    localparam integer SYNC_BITS         = 32;
+    localparam integer FRAME_PERIOD_BITS = SYNC_BITS + HEADER_BITS + PAYLOAD_BITS; // 112
+    localparam integer TIMER_W           = $clog2(FRAME_PERIOD_BITS);
+
+    localparam [1:0] SEARCH = 2'b00;
+
+    reg [TIMER_W-1:0] bit_timer;
+    reg               bit_timer_active;
+    wire              frame_start;
+
+    // ------------------------------------------------------------
+    // 1. Member 1: Sync Word Correlator
+    // ------------------------------------------------------------
+    sync_correlator #(
+        .SYNC_WORD(SYNC_WORD),
+        .THRESHOLD(CORRELATION_THRESHOLD)
+    ) u_correlator (
+        .clk            (clk),
+        .rst            (rst),
+        .rx_bit         (rx_bit),
+        .sync_candidate (sync_candidate),
+        .window_valid   (window_valid)
+    );
+
+    // ------------------------------------------------------------
+    // 2. Expected Marker Period Timer (112-bit modulo counter)
+    // ------------------------------------------------------------
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            bit_timer        <= {TIMER_W{1'b0}};
+            bit_timer_active <= 1'b0;
+        end
+        else begin
+            if (state_debug == SEARCH) begin
+                bit_timer <= {TIMER_W{1'b0}};
+                if (sync_candidate) begin
+                    bit_timer_active <= 1'b1;
+                    bit_timer        <= {TIMER_W{1'b0}};
+                end
+                else begin
+                    bit_timer_active <= 1'b0;
+                end
+            end
+            else if (bit_timer_active) begin
+                if (bit_timer == FRAME_PERIOD_BITS - 1)
+                    bit_timer <= {TIMER_W{1'b0}};
+                else
+                    bit_timer <= bit_timer + 1'b1;
+            end
+        end
+    end
+
+    // Gated check pulse asserted strictly at 112-bit intervals
+    assign marker_check_due = bit_timer_active && (bit_timer == FRAME_PERIOD_BITS - 1);
+    assign marker_match     = sync_candidate;
+
+    // ------------------------------------------------------------
+    // 3. Member 2: Frame Sync FSM
+    // ------------------------------------------------------------
+    frame_sync_fsm u_fsm (
+        .clk              (clk),
+        .rst              (rst),
+        .sync_candidate   (sync_candidate),
+        .marker_check_due (marker_check_due),
+        .marker_match     (marker_match),
+        .locked           (locked),
+        .state_debug      (state_debug)
+    );
+
+    // ------------------------------------------------------------
+    // 4. Zero-Latency Extraction Trigger
+    // ------------------------------------------------------------
+    assign frame_start = locked && marker_check_due && marker_match;
+
+    // ------------------------------------------------------------
+    // 5. Member 4: Telemetry Frame Extractor
+    // ------------------------------------------------------------
+    frame_extractor #(
+        .HEADER_BITS  (HEADER_BITS),
+        .PAYLOAD_BITS (PAYLOAD_BITS),
+        .VCID_WIDTH   (VCID_WIDTH),
+        .VCID_LSB     (VCID_LSB)
+    ) u_extractor (
+        .clk         (clk),
+        .rst         (rst),
+        .rx_bit      (rx_bit),
+        .locked      (locked),
+        .frame_start (frame_start),
+        .header_out  (header_out),
+        .payload_out (payload_out),
+        .vcid_out    (vcid_out),
+        .frame_valid (frame_valid)
+    );
+
+endmodule

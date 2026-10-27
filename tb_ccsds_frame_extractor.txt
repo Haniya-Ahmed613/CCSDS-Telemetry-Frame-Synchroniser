@@ -1,0 +1,270 @@
+`timescale 1ns/1ps
+
+module tb_ccsds_sync_top;
+
+    localparam [31:0] SYNC_WORD    = 32'h1ACFFC1D;
+    localparam integer HEADER_BITS  = 16;
+    localparam integer PAYLOAD_BITS = 64;
+
+    reg clk;
+    reg rst;
+    reg rx_bit;
+
+    wire sync_candidate;
+    wire window_valid;
+    wire locked;
+    wire [1:0] state_debug;
+    wire marker_check_due;
+    wire marker_match;
+
+    wire [HEADER_BITS-1:0]  header_out;
+    wire [PAYLOAD_BITS-1:0] payload_out;
+    wire [2:0]              vcid_out;
+    wire                    frame_valid;
+
+    integer test_errors;
+    integer frames_captured;
+
+    // Queues for expected values
+    reg [HEADER_BITS-1:0]  exp_header_q[$];
+    reg [PAYLOAD_BITS-1:0] exp_payload_q[$];
+    reg [2:0]              exp_vcid_q[$];
+
+    // Temporary variables declared at module scope to satisfy vlog-2244
+    reg [HEADER_BITS-1:0]  exp_h;
+    reg [PAYLOAD_BITS-1:0] exp_p;
+    reg [2:0]              exp_v;
+
+    // ------------------------------------------------------------
+    // DUT Instance
+    // ------------------------------------------------------------
+    ccsds_sync_top #(
+        .SYNC_WORD             (SYNC_WORD),
+        .CORRELATION_THRESHOLD (0),
+        .HEADER_BITS           (HEADER_BITS),
+        .PAYLOAD_BITS          (PAYLOAD_BITS),
+        .VCID_WIDTH            (3),
+        .VCID_LSB              (11)
+    ) dut (
+        .clk              (clk),
+        .rst              (rst),
+        .rx_bit           (rx_bit),
+        .sync_candidate   (sync_candidate),
+        .window_valid     (window_valid),
+        .locked           (locked),
+        .state_debug      (state_debug),
+        .marker_check_due (marker_check_due),
+        .marker_match     (marker_match),
+        .header_out       (header_out),
+        .payload_out      (payload_out),
+        .vcid_out         (vcid_out),
+        .frame_valid      (frame_valid)
+    );
+
+    // 100 MHz clock
+    initial clk = 1'b0;
+    always #5 clk = ~clk;
+
+    // ------------------------------------------------------------
+    // Transmit Helper Tasks
+    // ------------------------------------------------------------
+    task send_bit(input reg b);
+        begin
+            @(negedge clk);
+            rx_bit = b;
+            @(posedge clk);
+            #1;
+        end
+    endtask
+
+    task send_word(input [31:0] val, input integer bits);
+        integer i;
+        begin
+            for (i = bits - 1; i >= 0; i = i - 1)
+                send_bit(val[i]);
+        end
+    endtask
+
+    task send_payload64(input [63:0] val);
+        integer i;
+        begin
+            for (i = 63; i >= 0; i = i - 1)
+                send_bit(val[i]);
+        end
+    endtask
+
+    task send_frame(
+        input [31:0] marker,
+        input [15:0] header,
+        input [63:0] payload,
+        input bit    expect_valid
+    );
+        begin
+            if (expect_valid) begin
+                exp_header_q.push_back(header);
+                exp_payload_q.push_back(payload);
+                exp_vcid_q.push_back(header[13:11]);
+            end
+            send_word(marker, 32);
+            send_word(header, 16);
+            send_payload64(payload);
+        end
+    endtask
+
+    task reset_dut;
+        begin
+            @(negedge clk);
+            rst    = 1'b1;
+            rx_bit = 1'b0;
+            frames_captured = 0;
+            exp_header_q.delete();
+            exp_payload_q.delete();
+            exp_vcid_q.delete();
+            repeat (3) @(negedge clk);
+            rst = 1'b0;
+            repeat (2) @(negedge clk);
+        end
+    endtask
+
+    task check_condition(input string name, input bit cond);
+        begin
+            if (cond) begin
+                $display("  [PASS] %s", name);
+            end
+            else begin
+                $display("  [FAIL] %s", name);
+                test_errors = test_errors + 1;
+            end
+        end
+    endtask
+
+    // ------------------------------------------------------------
+    // Real-Time Frame Verification Monitor
+    // ------------------------------------------------------------
+    always @(negedge clk) begin
+        if (!rst && frame_valid) begin
+            frames_captured = frames_captured + 1;
+            $display("  --> FRAME STROBE: Time=%0t | HDR=%h | PAYLOAD=%h | VCID=%0d",
+                     $time, header_out, payload_out, vcid_out);
+
+            if (exp_header_q.size() > 0) begin
+                exp_h = exp_header_q.pop_front();
+                exp_p = exp_payload_q.pop_front();
+                exp_v = exp_vcid_q.pop_front();
+
+                if (header_out !== exp_h || payload_out !== exp_p || vcid_out !== exp_v) begin
+                    $display("  [FAIL] Frame mismatch! Expected HDR=%h, Got=%h | Expected VCID=%0d, Got=%0d",
+                             exp_h, header_out, exp_v, vcid_out);
+                    test_errors = test_errors + 1;
+                end
+            end
+            else begin
+                $display("  [FAIL] Unexpected frame_valid strobe emitted!");
+                test_errors = test_errors + 1;
+            end
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Verification Scenarios
+    // ------------------------------------------------------------
+    initial begin
+        test_errors     = 0;
+        frames_captured = 0;
+        rst             = 1'b1;
+        rx_bit          = 1'b0;
+
+        $display("===============================================================");
+        $display("   CCSDS TELEMETRY FRAME SYNCHRONIZER VERIFICATION SUITE       ");
+        $display("===============================================================");
+
+        // TEST 1: Lock Sequence
+        $display("\nTEST 1: Lock Acquisition & State Transitions");
+        reset_dut();
+        send_frame(SYNC_WORD, 16'h0001, 64'h1111_1111_1111_1111, 0);
+        check_condition("Transitions to VERIFY after marker 1", state_debug == 2'b01 && !locked);
+
+        send_frame(SYNC_WORD, 16'h0002, 64'h2222_2222_2222_2222, 0);
+        check_condition("Remains in VERIFY after check 1", state_debug == 2'b01 && !locked);
+
+        send_frame(SYNC_WORD, 16'h0003, 64'h3333_3333_3333_3333, 0);
+        check_condition("Transitions to LOCKED after check 2", state_debug == 2'b10 && locked);
+
+        // TEST 2: Extraction Across Channels
+        $display("\nTEST 2: Accurate Extraction of Multiple Virtual Channels (VCID)");
+        frames_captured = 0;
+        // VCID 2 = Header[13:11] = 3'b010 -> 16'h1001
+        send_frame(SYNC_WORD, 16'h1001, 64'hCAFE_BABE_0000_0001, 1);
+        // VCID 5 = Header[13:11] = 3'b101 -> 16'h2802
+        send_frame(SYNC_WORD, 16'h2802, 64'hFEED_FACE_1111_2222, 1);
+        // VCID 7 = Header[13:11] = 3'b111 -> 16'h3803
+        send_frame(SYNC_WORD, 16'h3803, 64'hDEAD_BEEF_3333_4444, 1);
+
+        repeat (2) @(negedge clk);
+        check_condition("Extracted all 3 multi-channel frames cleanly", frames_captured == 3);
+
+        // TEST 3: Bit Slip Handling
+        $display("\nTEST 3: Handling Leading Bit Slips (Correlator Alignment)");
+        reset_dut();
+        send_bit(1'b1);
+        send_bit(1'b0);
+        send_bit(1'b1); // 3-bit off-phase slip
+        send_frame(SYNC_WORD, 16'h0001, 64'h0, 0);
+        check_condition("Aligns on marker despite 3-bit phase slip", state_debug == 2'b01);
+
+        // TEST 4: Bit Error Rejection
+        $display("\nTEST 4: Corrupted Marker Bit-Error Rejection (Threshold=0)");
+        reset_dut();
+        send_frame(SYNC_WORD ^ 32'h0000_0001, 16'h0, 64'h0, 0);
+        check_condition("Rejects 1-bit corrupted sync marker in SEARCH", state_debug == 2'b00 && !locked);
+
+        // TEST 5: False Sync Word Immunity
+        $display("\nTEST 5: False Sync Candidate Immunity in Data Stream");
+        reset_dut();
+        send_frame(SYNC_WORD, 16'h0001, 64'h0, 0);
+        send_frame(SYNC_WORD, 16'h0002, {SYNC_WORD, 32'hFFFF_FFFF}, 0);
+        check_condition("Periodic timer ignores false sync candidate embedded in payload",
+                        state_debug == 2'b01 && !locked);
+
+        // TEST 6: Flywheel Operation
+        $display("\nTEST 6: Flywheel Resistance to Single Marker Drop");
+        reset_dut();
+        send_frame(SYNC_WORD, 16'h0001, 64'h0, 0);
+        send_frame(SYNC_WORD, 16'h0002, 64'h0, 0);
+        send_frame(SYNC_WORD, 16'h0003, 64'h0, 0);
+        check_condition("Synchronizer reached LOCKED", locked == 1'b1);
+
+        send_frame(SYNC_WORD ^ 32'h0000_0002, 16'h1004, 64'hA5A5, 0);
+        check_condition("Flywheel maintains lock during single corrupted marker", locked == 1'b1);
+
+        // TEST 7: Loss of Lock
+        $display("\nTEST 7: Consecutive Corruptions Force Loss of Lock");
+        frames_captured = 0;
+        send_frame(SYNC_WORD ^ 32'h0000_0004, 16'h1005, 64'h5A5A, 0);
+        check_condition("Second bad marker drops lock to SEARCH", state_debug == 2'b00 && locked == 1'b0);
+        check_condition("Extractor suppresses frame_valid on sync loss", frames_captured == 0);
+
+        // TEST 8: Reacquisition
+        $display("\nTEST 8: Reacquisition after Signal Recovery");
+        frames_captured = 0;
+        send_frame(SYNC_WORD, 16'h0006, 64'h0, 0);
+        send_frame(SYNC_WORD, 16'h0007, 64'h0, 0);
+        send_frame(SYNC_WORD, 16'h0008, 64'h0, 0);
+        check_condition("Reacquires lock after stream restored", locked == 1'b1 && state_debug == 2'b10);
+
+        send_frame(SYNC_WORD, 16'h1809, 64'h0123_4567_89AB_CDEF, 1); // VCID 3
+        repeat (2) @(negedge clk);
+        check_condition("Resumes valid frame extraction upon reacquisition", frames_captured == 1);
+
+        // Summary
+        $display("\n===============================================================");
+        if (test_errors == 0)
+            $display("   RESULT: ALL 8 TEST SCENARIOS PASSED SUCCESSFULLY           ");
+        else
+            $display("   RESULT: %0d TESTS FAILED                                    ", test_errors);
+        $display("===============================================================");
+
+        $finish;
+    end
+
+endmodule

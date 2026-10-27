@@ -1,0 +1,82 @@
+`timescale 1ns/1ps
+
+module frame_extractor #(
+    parameter integer HEADER_BITS  = 16,
+    parameter integer PAYLOAD_BITS = 64,
+    parameter integer VCID_WIDTH   = 3,
+    parameter integer VCID_LSB     = 11   // Header[13:11]
+)(
+    input  wire clk,
+    input  wire rst,
+    input  wire rx_bit,
+
+    // Status from synchronizer top
+    input  wire locked,
+    input  wire frame_start,
+
+    // Extracted telemetry outputs
+    output reg  [HEADER_BITS-1:0]  header_out,
+    output reg  [PAYLOAD_BITS-1:0] payload_out,
+    output reg  [VCID_WIDTH-1:0]   vcid_out,
+    output reg                     frame_valid
+);
+
+    localparam integer TOTAL_DATA_BITS = HEADER_BITS + PAYLOAD_BITS; // 80 bits
+    localparam integer CNT_W = $clog2(TOTAL_DATA_BITS + 1);
+
+    reg [HEADER_BITS-1:0]  header_shift;
+    reg [PAYLOAD_BITS-1:0] payload_shift;
+    reg [CNT_W-1:0]        bit_cnt;
+    reg                    capturing;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            header_out    <= {HEADER_BITS{1'b0}};
+            payload_out   <= {PAYLOAD_BITS{1'b0}};
+            vcid_out      <= {VCID_WIDTH{1'b0}};
+            frame_valid   <= 1'b0;
+
+            header_shift  <= {HEADER_BITS{1'b0}};
+            payload_shift <= {PAYLOAD_BITS{1'b0}};
+            bit_cnt       <= {CNT_W{1'b0}};
+            capturing     <= 1'b0;
+        end
+        else begin
+            // 1-cycle strobe default
+            frame_valid <= 1'b0;
+
+            // Abort immediately if lock is lost
+            if (!locked) begin
+                capturing <= 1'b0;
+                bit_cnt   <= {CNT_W{1'b0}};
+            end
+            else if (frame_start) begin
+                // First bit of Header (MSB: HDR[15]) arrives on this exact clock edge
+                header_shift  <= {{(HEADER_BITS-1){1'b0}}, rx_bit};
+                payload_shift <= {PAYLOAD_BITS{1'b0}};
+                bit_cnt       <= 1;
+                capturing     <= 1'b1;
+            end
+            else if (capturing) begin
+                if (bit_cnt < HEADER_BITS) begin
+                    header_shift <= {header_shift[HEADER_BITS-2:0], rx_bit};
+                    bit_cnt      <= bit_cnt + 1'b1;
+                end
+                else if (bit_cnt < TOTAL_DATA_BITS - 1) begin
+                    payload_shift <= {payload_shift[PAYLOAD_BITS-2:0], rx_bit};
+                    bit_cnt       <= bit_cnt + 1'b1;
+                end
+                else if (bit_cnt == TOTAL_DATA_BITS - 1) begin
+                    // Final bit of Payload arrives on this edge
+                    header_out   <= header_shift;
+                    payload_out  <= {payload_shift[PAYLOAD_BITS-2:0], rx_bit};
+                    vcid_out     <= header_shift[VCID_LSB +: VCID_WIDTH];
+                    frame_valid  <= 1'b1;
+                    capturing    <= 1'b0;
+                    bit_cnt      <= {CNT_W{1'b0}};
+                end
+            end
+        end
+    end
+
+endmodule
